@@ -1,0 +1,190 @@
+import pandas as pd
+import numpy as np
+from sklearn.metrics.pairwise import cosine_similarity
+from scipy import sparse
+from sklearn.datasets import dump_svmlight_file
+
+
+# ==================================
+# FILE PATHS FOR GOOGLE COLAB
+# ==================================
+ratings_file = "Ratings.csv"
+users_file   = "Users.csv"
+books_file   = "Books.csv"
+output_dir   = "Part2Results"
+
+
+# ==================================
+# LOAD BOOK METADATA
+# ==================================
+books_df = pd.read_csv(books_file, delimiter=';')
+books_df = books_df[['ISBN', 'Title', 'Author', 'Year', 'Publisher']]
+books_df.columns = ['ISBN', 'Title', 'Author', 'Year', 'Publisher']
+
+
+
+# ====================================================
+# FUNCTION 1 – CREATE LIBSVM + SPARSE USER–ITEM MATRIX
+# ====================================================
+def create_libsvm_file(ratings_df, output_filename, output_path):
+
+    isbn_index_map = {isbn: idx for idx, isbn in enumerate(ratings_df['ISBN'].unique())}
+    user_index_map = {user: idx for idx, user in enumerate(ratings_df['User-ID'].unique())}
+
+    user_indices = ratings_df['User-ID'].map(user_index_map).values
+    isbn_indices = ratings_df['ISBN'].map(isbn_index_map).values
+    rating_values = ratings_df['Rating'].values
+
+    rating_matrix = sparse.csr_matrix((rating_values, (user_indices, isbn_indices)))
+
+    labels = rating_matrix[:, 0].toarray().ravel()
+
+    dump_svmlight_file(rating_matrix, labels, output_path + output_filename)
+
+    return rating_matrix, user_index_map, isbn_index_map
+
+
+
+# ====================================================
+# FUNCTION 2 – BATCHED USER-USER RECOMMENDATIONS
+# ====================================================
+def generate_recommendations_in_batches(rating_matrix, user_index_map, isbn_index_map,
+                                        K=10, top_n=5, batch_size=1000):
+
+    index_to_user = {i: u for u, i in user_index_map.items()}
+    index_to_isbn = {i: b for b, i in isbn_index_map.items()}
+
+    num_users = rating_matrix.shape[0]
+    recommendations_output = []
+    valid_isbns = set(books_df['ISBN'])
+
+    for batch_start in range(0, num_users, batch_size):
+
+        batch_end = min(batch_start + batch_size, num_users)
+        print(f"Processing users {batch_start} → {batch_end}...")
+
+        batch_users = list(range(batch_start, batch_end))
+        batch_vectors = rating_matrix[batch_users]
+
+
+        # -----------------------------------------------------
+        # PART 1 – Cosine Similarity
+        # -----------------------------------------------------
+        batch_sim_matrix = cosine_similarity(batch_vectors, rating_matrix)
+
+
+        for i, user_idx in enumerate(batch_users):
+
+            user_vector = rating_matrix.getrow(user_idx)
+            similarity_scores = batch_sim_matrix[i]
+
+            similarity_scores[user_idx] = -1
+
+            top_neighbors = np.argsort(similarity_scores)[-K:][::-1]
+
+
+            # -----------------------------------------------------
+            # PART 2 – Candidate Books
+            # -----------------------------------------------------
+            candidate_books = set()
+
+            for neighbor in top_neighbors:
+                neighbor_books = rating_matrix.getrow(neighbor).nonzero()[1]
+                candidate_books.update(neighbor_books)
+
+            already_rated = set(user_vector.nonzero()[1])
+            candidate_books.difference_update(already_rated)
+
+            valid_candidates = [
+                b for b in candidate_books
+                if index_to_isbn[b] in valid_isbns
+            ]
+
+
+            # -----------------------------------------------------
+            # PART 3 – Estimate Scores
+            # -----------------------------------------------------
+            estimated_scores = {}
+
+            for book_idx in valid_candidates:
+                weighted_sum = 0
+                weight_total = 0
+
+                for neighbor in top_neighbors:
+                    neighbor_rating = rating_matrix[neighbor, book_idx]
+
+                    if neighbor_rating > 0:
+                        weighted_sum += similarity_scores[neighbor] * neighbor_rating
+                        weight_total += similarity_scores[neighbor]
+
+                if weight_total > 0:
+                    estimated_scores[book_idx] = weighted_sum / weight_total
+
+
+            # -----------------------------------------------------
+            # PART 4 – Select Top-N Recommendations
+            # -----------------------------------------------------
+            top_picks = sorted(
+                estimated_scores.items(),
+                key=lambda x: x[1],
+                reverse=True
+            )[:top_n]
+
+            for book_idx, score in top_picks:
+                recommendations_output.append({
+                    "User_ID": index_to_user[user_idx],
+                    "Book_ID": index_to_isbn[book_idx],
+                    "Recommendation_Score": score
+                })
+
+    return recommendations_output
+
+
+
+# ==================================
+# SAVE RESULTS
+# ==================================
+def save_recommendations(recommendations_list, output_csv, books_df):
+
+    rec_df = pd.DataFrame(recommendations_list)
+
+    rec_df = rec_df.merge(
+        books_df[['ISBN', 'Title']],
+        left_on='Book_ID',
+        right_on='ISBN',
+        how='left'
+    )
+
+    rec_df['Book_Title'] = rec_df['Title']
+    rec_df = rec_df[['User_ID', 'Book_ID', 'Book_Title', 'Recommendation_Score']]
+    rec_df = rec_df.sort_values('User_ID')
+
+    rec_df.to_csv(output_csv, index=False)
+
+
+
+# ==================================
+# RUN PIPELINE
+# ==================================
+ratings_df = pd.read_csv(ratings_file, delimiter=';')
+ratings_df.drop_duplicates(inplace=True)
+
+rating_matrix, user_map, isbn_map = create_libsvm_file(
+    ratings_df,
+    "book_ratings.libsvm",
+    output_dir
+)
+
+recommendations_list = generate_recommendations_in_batches(
+    rating_matrix,
+    user_map,
+    isbn_map
+)
+
+save_recommendations(
+    recommendations_list,
+    output_dir + "book_recommendations.csv",
+    books_df
+)
+
+print("Total recommendations:", len(recommendations_list))
